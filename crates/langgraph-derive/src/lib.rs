@@ -171,31 +171,62 @@ pub fn tool(attr: TokenStream, item: TokenStream) -> TokenStream {
 }
 
 struct ToolMacroArgs {
-    name: Lit,
-    description: Lit,
+    name: Option<Lit>,
+    description: Option<Lit>,
 }
 
 impl syn::parse::Parse for ToolMacroArgs {
     fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
+        if input.is_empty() {
+            return Ok(Self { name: None, description: None });
+        }
         let name: Lit = input.parse()?;
-        input.parse::<syn::Token![,]>()?;
-        let description: Lit = input.parse()?;
-        Ok(Self { name, description })
+        let description = if input.peek(syn::Token![,]) {
+            input.parse::<syn::Token![,]>()?;
+            Some(input.parse()?)
+        } else {
+            None
+        };
+        Ok(Self { name: Some(name), description })
     }
 }
 
-fn impl_tool_macro(name_lit: &Lit, desc_lit: &Lit, func: &ItemFn) -> TokenStream {
+fn impl_tool_macro(name_lit: &Option<Lit>, desc_lit: &Option<Lit>, func: &ItemFn) -> TokenStream {
     let fn_name = &func.sig.ident;
     let fn_name_str = fn_name.to_string();
 
     // Get tool name and description as strings
-    let tool_name = match name_lit {
-        Lit::Str(s) => s.value(),
-        _ => panic!("tool name must be a string literal"),
+    let tool_name = if let Some(Lit::Str(s)) = name_lit {
+        s.value()
+    } else {
+        fn_name_str.clone()
     };
-    let description = match desc_lit {
-        Lit::Str(s) => s.value(),
-        _ => panic!("description must be a string literal"),
+    
+    let description = if let Some(desc) = desc_lit {
+        match desc {
+            Lit::Str(s) => s.value(),
+            _ => panic!("description must be a string literal"),
+        }
+    } else {
+        // Extract from doc attributes
+        let mut extracted_desc = String::new();
+        for attr in &func.attrs {
+            if attr.path().is_ident("doc") {
+                if let syn::Meta::NameValue(nv) = &attr.meta {
+                    if let syn::Expr::Lit(expr_lit) = &nv.value {
+                        if let syn::Lit::Str(lit_str) = &expr_lit.lit {
+                            let doc_str = lit_str.value();
+                            let trimmed = doc_str.trim();
+                            if !extracted_desc.is_empty() {
+                                extracted_desc.push_str(" ");
+                            }
+                            extracted_desc.push_str(trimmed);
+                        }
+                    }
+                }
+            }
+        }
+        extracted_desc
     };
 
     // Generate CamelCase struct name
@@ -215,27 +246,42 @@ fn impl_tool_macro(name_lit: &Lit, desc_lit: &Lit, func: &ItemFn) -> TokenStream
     // Generate JSON schema properties
     let properties: Vec<proc_macro2::TokenStream> = params.iter().map(|(name, ty)| {
         let name_str = name.to_string();
-        let json_type = rust_type_to_json_type(ty);
+        let actual_ty = if is_option(ty) { extract_type_from_option(ty) } else { ty };
+        let json_type = rust_type_to_json_type(actual_ty);
         quote! {
             (#name_str, serde_json::json!({"type": #json_type}))
         }
     }).collect();
 
-    let required: Vec<String> = params.iter().map(|(name, _)| name.to_string()).collect();
+    let required: Vec<String> = params.iter()
+        .filter(|(_, ty)| !is_option(ty))
+        .map(|(name, _)| name.to_string())
+        .collect();
 
     // Generate parameter extraction code
     let extractions: Vec<proc_macro2::TokenStream> = params.iter().map(|(name, ty)| {
         let name_str = name.to_string();
-        let err_missing = format!("missing required parameter '{}'", name_str);
         let err_invalid = format!("invalid parameter '{}': {{}}", name_str);
-        quote! {
-            let #name: #ty = serde_json::from_value(
-                args.get(#name_str)
-                    .cloned()
-                    .ok_or_else(|| langgraph_prebuilt::ToolError::InvalidArgs(#err_missing.to_string()))?
-            ).map_err(|e| langgraph_prebuilt::ToolError::InvalidArgs(
-                format!(#err_invalid, e)
-            ))?;
+        
+        if is_option(ty) {
+            quote! {
+                let #name: #ty = match args.get(#name_str) {
+                    Some(v) => serde_json::from_value(v.clone())
+                        .map_err(|e| langgraph_prebuilt::ToolError::InvalidArgs(format!(#err_invalid, e)))?,
+                    None => None,
+                };
+            }
+        } else {
+            let err_missing = format!("missing required parameter '{}'", name_str);
+            quote! {
+                let #name: #ty = serde_json::from_value(
+                    args.get(#name_str)
+                        .cloned()
+                        .ok_or_else(|| langgraph_prebuilt::ToolError::InvalidArgs(#err_missing.to_string()))?
+                ).map_err(|e| langgraph_prebuilt::ToolError::InvalidArgs(
+                    format!(#err_invalid, e)
+                ))?;
+            }
         }
     }).collect();
 
@@ -255,10 +301,20 @@ fn impl_tool_macro(name_lit: &Lit, desc_lit: &Lit, func: &ItemFn) -> TokenStream
         _ => false,
     };
 
+    // Determine if the function is async
+    let is_async = func.sig.asyncness.is_some();
+
+    // Generate the invoke body based on return type and asyncness
+    let await_tokens = if is_async {
+        quote! { .await }
+    } else {
+        quote! {}
+    };
+
     let invoke_body = if is_result_return {
         quote! {
             #(#extractions)*
-            let result = #fn_name(#(#param_names),*);
+            let result = #fn_name(#(#param_names),*)#await_tokens;
             result
                 .map_err(|e| {
                     let tool_err: langgraph_prebuilt::ToolError = e.into();
@@ -271,10 +327,42 @@ fn impl_tool_macro(name_lit: &Lit, desc_lit: &Lit, func: &ItemFn) -> TokenStream
     } else {
         quote! {
             #(#extractions)*
-            let result = #fn_name(#(#param_names),*);
+            let result = #fn_name(#(#param_names),*)#await_tokens;
             serde_json::to_value(result).map_err(|e| langgraph_prebuilt::ToolError::Execution(
                 format!("failed to serialize result: {}", e)
             ))
+        }
+    };
+
+    let trait_methods = if is_async {
+        quote! {
+            fn invoke(
+                &self,
+                _args: &serde_json::Value,
+                _config: &langgraph_checkpoint::config::RunnableConfig,
+            ) -> Result<serde_json::Value, langgraph_prebuilt::ToolError> {
+                Err(langgraph_prebuilt::ToolError::Execution(
+                    "This tool is asynchronous and must be invoked with ainvoke".to_string()
+                ))
+            }
+
+            async fn ainvoke(
+                &self,
+                args: &serde_json::Value,
+                _config: &langgraph_checkpoint::config::RunnableConfig,
+            ) -> Result<serde_json::Value, langgraph_prebuilt::ToolError> {
+                #invoke_body
+            }
+        }
+    } else {
+        quote! {
+            fn invoke(
+                &self,
+                args: &serde_json::Value,
+                _config: &langgraph_checkpoint::config::RunnableConfig,
+            ) -> Result<serde_json::Value, langgraph_prebuilt::ToolError> {
+                #invoke_body
+            }
         }
     };
 
@@ -322,13 +410,7 @@ fn impl_tool_macro(name_lit: &Lit, desc_lit: &Lit, func: &ItemFn) -> TokenStream
                 }))
             }
 
-            fn invoke(
-                &self,
-                args: &serde_json::Value,
-                _config: &langgraph_checkpoint::config::RunnableConfig,
-            ) -> Result<serde_json::Value, langgraph_prebuilt::ToolError> {
-                #invoke_body
-            }
+            #trait_methods
         }
     };
 
@@ -414,4 +496,28 @@ fn impl_traceable(input: &DeriveInput) -> TokenStream {
     };
 
     TokenStream::from(expanded)
+}
+
+fn is_option(ty: &syn::Type) -> bool {
+    if let syn::Type::Path(type_path) = ty {
+        if let Some(segment) = type_path.path.segments.last() {
+            return segment.ident == "Option";
+        }
+    }
+    false
+}
+
+fn extract_type_from_option(ty: &syn::Type) -> &syn::Type {
+    if let syn::Type::Path(type_path) = ty {
+        if let Some(segment) = type_path.path.segments.last() {
+            if segment.ident == "Option" {
+                if let syn::PathArguments::AngleBracketed(args) = &segment.arguments {
+                    if let Some(syn::GenericArgument::Type(inner_ty)) = args.args.first() {
+                        return inner_ty;
+                    }
+                }
+            }
+        }
+    }
+    ty
 }
