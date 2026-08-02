@@ -1018,7 +1018,10 @@ mod tests {
         .fetch_one(&saver.pool)
         .await
         .unwrap();
-        assert_eq!(blob_count, 3, "expected blobs a@1, b@1, a@2, got {blob_count}");
+        assert_eq!(
+            blob_count, 3,
+            "expected blobs a@1, b@1, a@2, got {blob_count}"
+        );
 
         // cp2 reads back both channels: a@2 via cp2's blob, b@1 via the
         // version-addressed blob written by cp1 (b's version never moved).

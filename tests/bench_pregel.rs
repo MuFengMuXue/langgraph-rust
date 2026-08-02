@@ -40,8 +40,7 @@ fn build_linear_graph(checkpointer: Arc<dyn BaseCheckpointSaver>) -> CompiledSta
     let mut channels: HashMap<String, Box<dyn Channel>> = HashMap::new();
     channels.insert(
         "messages".to_string(),
-        Box::new(BinaryOperatorAggregate::new("messages", add_messages_ref))
-            as Box<dyn Channel>,
+        Box::new(BinaryOperatorAggregate::new("messages", add_messages_ref)) as Box<dyn Channel>,
     );
 
     let mut graph = StateGraph::new(channels);
@@ -220,9 +219,12 @@ async fn bench_sqlite_static_context() {
         );
 
         // Seed the static channel once, then grow messages every step.
-        app.ainvoke(&json!({"messages": [make_message(0)], "context": context}), &config)
-            .await
-            .unwrap();
+        app.ainvoke(
+            &json!({"messages": [make_message(0)], "context": context}),
+            &config,
+        )
+        .await
+        .unwrap();
 
         let start = Instant::now();
         for i in 1..steps {
@@ -254,7 +256,11 @@ async fn sanity_bench_graphs_work() {
         .unwrap();
     let snapshot = app.get_state(&config).unwrap();
     assert_eq!(
-        snapshot.values.get("messages").and_then(|m| m.as_array()).map(|a| a.len()),
+        snapshot
+            .values
+            .get("messages")
+            .and_then(|m| m.as_array())
+            .map(|a| a.len()),
         Some(4)
     );
 }
