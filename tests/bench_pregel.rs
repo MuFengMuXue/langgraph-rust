@@ -5,6 +5,18 @@
 //! ```text
 //! cargo test --release --test bench_pregel -- --ignored --nocapture
 //! ```
+//!
+//! Note: this file installs mimalloc as the global allocator. On Windows the
+//! default system heap is pathological for checkpointed workloads — large
+//! (500KB+) per-super-step state blocks are allocated and freed each step, and
+//! the heap's large-block path can slow the same binary by ~4x depending on
+//! machine state, making results non-reproducible. mimalloc's size-classed,
+//! thread-cached allocation keeps the numbers stable and representative of the
+//! library's actual (allocation-bound) costs.
+
+use mimalloc::MiMalloc;
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
 
 use langgraph::channels::{BinaryOperatorAggregate, Channel, LastValue};
 use langgraph::checkpoint::{BaseCheckpointSaver, InMemorySaver};
@@ -123,6 +135,83 @@ async fn bench_linear_checkpoint_sqlite() {
             elapsed / steps as u32
         );
     }
+}
+
+/// Multi-super-step loop: one invoke runs `target` super-steps via a
+/// self-looping conditional edge, growing the history each step. This is the
+/// shape that exercises the per-super-step output read (read_channels).
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn bench_multi_step_loop() {
+    for target in [50usize, 100, 200, 400] {
+        let app = build_loop_graph(Arc::new(InMemorySaver::new()), target);
+        let mut config = RunnableConfig::new();
+        config.insert(
+            "configurable".to_string(),
+            json!({"thread_id": "bench-loop"}),
+        );
+
+        let input = json!({"messages": [make_message(0)]});
+        let t = Instant::now();
+        app.ainvoke(&input, &config).await.unwrap();
+        let elapsed = t.elapsed();
+        println!(
+            "multi-step loop: {target:>3} super-steps in one invoke => {elapsed:?}  ({:?}/super-step)",
+            elapsed / target as u32
+        );
+    }
+}
+
+/// Single-node graph with a self-loop: node "append" routes back to itself
+/// until the history reaches `target` messages, then END.
+fn build_loop_graph(
+    checkpointer: Arc<dyn BaseCheckpointSaver>,
+    target: usize,
+) -> CompiledStateGraph {
+    let mut channels: HashMap<String, Box<dyn Channel>> = HashMap::new();
+    channels.insert(
+        "messages".to_string(),
+        Box::new(BinaryOperatorAggregate::new("messages", add_messages_ref)) as Box<dyn Channel>,
+    );
+
+    let mut graph = StateGraph::new(channels);
+    graph
+        .add_node(
+            "append",
+            |input: JsonValue, _config: RunnableConfig| async move {
+                let n = input
+                    .get("messages")
+                    .and_then(|m| m.as_array())
+                    .map(|a| a.len())
+                    .unwrap_or(0);
+                Ok(json!({"messages": [make_message(n)]}))
+            },
+        )
+        .unwrap();
+    graph.add_edge(START, "append").unwrap();
+    graph
+        .add_conditional_edges(
+            "append",
+            move |input: JsonValue, _config: RunnableConfig| async move {
+                let n = input
+                    .get("messages")
+                    .and_then(|m| m.as_array())
+                    .map(|a| a.len())
+                    .unwrap_or(0);
+                Ok(json!(if n >= target { "END" } else { "again" }))
+            },
+            Some(HashMap::from([
+                ("again".to_string(), "append".to_string()),
+                ("END".to_string(), END.to_string()),
+            ])),
+        )
+        .unwrap();
+
+    graph
+        .compile_builder()
+        .checkpointer(checkpointer)
+        .build()
+        .unwrap()
 }
 
 /// Wall-clock time to run `branches` parallel nodes in a single super-step.
