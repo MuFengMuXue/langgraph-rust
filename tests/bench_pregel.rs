@@ -58,22 +58,22 @@ fn make_message(i: usize) -> JsonValue {
     })
 }
 
+/// (thread_id, checkpoint_ns) -> (checkpoint_id, checkpoint, metadata, parent_cid)
+type StorageEntry = (String, Checkpoint, CheckpointMetadata, Option<String>);
+/// (thread_id, checkpoint_ns) -> the thread's newest checkpoint
+type StorageMap = HashMap<(String, String), StorageEntry>;
+/// (thread_id, checkpoint_ns, checkpoint_id) -> pending writes (interrupt-only path)
+type WritesMap = HashMap<(String, String, String), Vec<(String, String, JsonValue)>>;
+
 /// A checkpoint saver that retains only the newest checkpoint per thread.
 ///
 /// `InMemorySaver` keeps every checkpoint forever, so a benchmark that runs `N`
 /// super-steps with a growing message history retains O(N²) serialized state
 /// and OOMs after a few hundred steps. Production savers prune; this one does
 /// the same — each `put` replaces the thread's previous checkpoint, so retained
-/// memory is O(latest state). The serde round-trip (to_value on `put`,
-/// from_value on `get_tuple`) mirrors `InMemorySaver`, so the measured per-step
-/// cost stays comparable.
-/// (thread_id, checkpoint_ns) -> (checkpoint_id, checkpoint_json, metadata_json, parent_cid)
-type StorageEntry = (String, JsonValue, JsonValue, Option<String>);
-/// (thread_id, checkpoint_ns) -> the thread's newest checkpoint
-type StorageMap = HashMap<(String, String), StorageEntry>;
-/// (thread_id, checkpoint_ns, checkpoint_id) -> pending writes (interrupt-only path)
-type WritesMap = HashMap<(String, String, String), Vec<(String, String, JsonValue)>>;
-
+/// memory is O(latest state). It stores the `Checkpoint` struct directly (no
+/// JSON round trip), mirroring the current `InMemorySaver`, so the measured
+/// per-step cost stays comparable.
 struct LatestOnlySaver {
     storage: RwLock<StorageMap>,
     writes: RwLock<WritesMap>,
@@ -118,6 +118,7 @@ impl Default for LatestOnlySaver {
     }
 }
 
+#[async_trait::async_trait]
 impl BaseCheckpointSaver for LatestOnlySaver {
     fn get_tuple(
         &self,
@@ -125,7 +126,7 @@ impl BaseCheckpointSaver for LatestOnlySaver {
     ) -> Result<Option<CheckpointTuple>, CheckpointError> {
         let (thread_id, checkpoint_ns, requested_id) = Self::config_to_ids(config);
         let storage = self.storage.read().unwrap();
-        let Some((cid, checkpoint_json, metadata_json, parent_cid)) =
+        let Some((cid, checkpoint, metadata, parent_cid)) =
             storage.get(&(thread_id.clone(), checkpoint_ns.clone()))
         else {
             return Ok(None);
@@ -136,11 +137,6 @@ impl BaseCheckpointSaver for LatestOnlySaver {
                 return Ok(None);
             }
         }
-
-        let checkpoint: Checkpoint = serde_json::from_value(checkpoint_json.clone())
-            .map_err(|e| CheckpointError::Storage(e.to_string()))?;
-        let metadata: CheckpointMetadata = serde_json::from_value(metadata_json.clone())
-            .map_err(|e| CheckpointError::Storage(e.to_string()))?;
 
         let parent_config = parent_cid.as_ref().map(|pid| {
             let mut c = RunnableConfig::new();
@@ -176,8 +172,8 @@ impl BaseCheckpointSaver for LatestOnlySaver {
                 );
                 c
             },
-            checkpoint,
-            metadata,
+            checkpoint: checkpoint.clone(),
+            metadata: metadata.clone(),
             parent_config,
             pending_writes: if pending_writes.is_empty() {
                 None
@@ -216,11 +212,7 @@ impl BaseCheckpointSaver for LatestOnlySaver {
         }
 
         let mut results = Vec::new();
-        for ((tid, ns), (cid, checkpoint_json, metadata_json, parent_cid)) in entries {
-            let checkpoint: Checkpoint = serde_json::from_value(checkpoint_json.clone())
-                .map_err(|e| CheckpointError::Storage(e.to_string()))?;
-            let metadata: CheckpointMetadata = serde_json::from_value(metadata_json.clone())
-                .map_err(|e| CheckpointError::Storage(e.to_string()))?;
+        for ((tid, ns), (cid, checkpoint, metadata, parent_cid)) in entries {
             let parent_config = parent_cid.as_ref().map(|pid| {
                 let mut c = RunnableConfig::new();
                 c.insert(
@@ -246,8 +238,8 @@ impl BaseCheckpointSaver for LatestOnlySaver {
                     );
                     c
                 },
-                checkpoint,
-                metadata,
+                checkpoint: checkpoint.clone(),
+                metadata: metadata.clone(),
                 parent_config,
                 pending_writes: None,
             });
@@ -258,16 +250,11 @@ impl BaseCheckpointSaver for LatestOnlySaver {
     fn put(
         &self,
         config: &RunnableConfig,
-        checkpoint: &Checkpoint,
+        mut checkpoint: Checkpoint,
         metadata: &CheckpointMetadata,
-        _new_versions: &ChannelVersions,
+        new_versions: &ChannelVersions,
     ) -> Result<RunnableConfig, CheckpointError> {
         let (thread_id, checkpoint_ns, _) = Self::config_to_ids(config);
-
-        let checkpoint_json = serde_json::to_value(checkpoint)
-            .map_err(|e| CheckpointError::Storage(e.to_string()))?;
-        let metadata_json =
-            serde_json::to_value(metadata).map_err(|e| CheckpointError::Storage(e.to_string()))?;
 
         // The new checkpoint's parent is the thread's current newest.
         let parent_id = self
@@ -277,20 +264,47 @@ impl BaseCheckpointSaver for LatestOnlySaver {
             .get(&(thread_id.clone(), checkpoint_ns.clone()))
             .map(|(cid, _, _, _)| cid.clone());
 
-        // Replace the thread's checkpoint — only the newest is retained.
-        self.storage.write().unwrap().insert(
-            (thread_id.clone(), checkpoint_ns.clone()),
-            (
-                checkpoint.id.clone(),
-                checkpoint_json,
-                metadata_json,
-                parent_id,
-            ),
-        );
+        // Merge-on-put: the engine writes deltas (`new_versions` only), so
+        // move the moved channels' values over the retained state, drop
+        // channels cleared this step (moved with no value), and refresh the
+        // metadata fields. Only the newest checkpoint is retained.
+        let cid = checkpoint.id.clone();
+        let mut delta_values = std::mem::take(&mut checkpoint.channel_values);
+        let mut storage = self.storage.write().unwrap();
+        match storage.get_mut(&(thread_id.clone(), checkpoint_ns.clone())) {
+            Some((_, prev, prev_metadata, prev_parent)) => {
+                for channel in new_versions.keys() {
+                    match delta_values.remove(channel) {
+                        Some(val) => {
+                            prev.channel_values.insert(channel.clone(), val);
+                        }
+                        None => {
+                            prev.channel_values.remove(channel);
+                        }
+                    }
+                }
+                prev.v = checkpoint.v;
+                prev.id = checkpoint.id;
+                prev.ts = checkpoint.ts;
+                prev.channel_versions = checkpoint.channel_versions;
+                prev.versions_seen = checkpoint.versions_seen;
+                prev.updated_channels = checkpoint.updated_channels;
+                *prev_metadata = metadata.clone();
+                *prev_parent = parent_id;
+            }
+            None => {
+                storage.insert(
+                    (thread_id.clone(), checkpoint_ns.clone()),
+                    (cid.clone(), checkpoint, metadata.clone(), parent_id),
+                );
+            }
+        }
+        drop(storage);
         // Prune pending writes down to the newest checkpoint id.
-        self.writes.write().unwrap().retain(|(tid, ns, cid), _| {
-            tid != &thread_id || ns != &checkpoint_ns || cid == &checkpoint.id
-        });
+        self.writes
+            .write()
+            .unwrap()
+            .retain(|(tid, ns, cid2), _| tid != &thread_id || ns != &checkpoint_ns || cid2 == &cid);
 
         let mut new_config = RunnableConfig::new();
         new_config.insert(
@@ -298,7 +312,7 @@ impl BaseCheckpointSaver for LatestOnlySaver {
             serde_json::json!({
                 "thread_id": thread_id,
                 "checkpoint_ns": checkpoint_ns,
-                "checkpoint_id": checkpoint.id,
+                "checkpoint_id": cid,
             }),
         );
         Ok(new_config)
@@ -333,6 +347,40 @@ impl BaseCheckpointSaver for LatestOnlySaver {
             .unwrap()
             .retain(|(tid, _, _), _| tid != thread_id);
         Ok(())
+    }
+
+    // Async overrides mirroring InMemorySaver: pure in-memory, so skip the
+    // trait default's block_in_place bridge — the benches must measure the
+    // native in-memory path, not a thread handoff per call.
+    async fn aget_tuple(
+        &self,
+        config: &RunnableConfig,
+    ) -> Result<Option<CheckpointTuple>, CheckpointError> {
+        self.get_tuple(config)
+    }
+
+    async fn aput(
+        &self,
+        config: &RunnableConfig,
+        checkpoint: Checkpoint,
+        metadata: &CheckpointMetadata,
+        new_versions: &ChannelVersions,
+    ) -> Result<RunnableConfig, CheckpointError> {
+        self.put(config, checkpoint, metadata, new_versions)
+    }
+
+    async fn aput_writes(
+        &self,
+        config: &RunnableConfig,
+        writes: Vec<(String, String, JsonValue)>,
+        task_id: String,
+        task_path: String,
+    ) -> Result<(), CheckpointError> {
+        self.put_writes(config, &writes, &task_id, &task_path)
+    }
+
+    async fn adelete_thread(&self, thread_id: String) -> Result<(), CheckpointError> {
+        self.delete_thread(&thread_id)
     }
 }
 
@@ -565,6 +613,76 @@ async fn bench_parallel_fanout() {
     }
 }
 
+/// Linear chain of `nodes` no-op nodes (START -> n0 -> n1 -> ... -> END),
+/// mirroring juncture's `sequential.rs` bench 1:1 so the per-node framework
+/// overhead is directly comparable (juncture reference: ~2.3µs/node at 1000,
+/// measured 2026-08-02). Each node returns an empty update; the last writes a
+/// `done` marker so the chain is verified to have run all `nodes` super-steps —
+/// a silent truncation fails the assert, not the timing. A chain is one
+/// super-step per node, so the recursion limit is raised above the 25 default.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn bench_sequential_chain() {
+    const REPS: u32 = 3;
+
+    for nodes in [10usize, 100, 500, 1000] {
+        let mut channels: HashMap<String, Box<dyn Channel>> = HashMap::new();
+        channels.insert(
+            "messages".to_string(),
+            Box::new(BinaryOperatorAggregate::new("messages", add_messages_ref))
+                as Box<dyn Channel>,
+        );
+        channels.insert("done".to_string(), Box::new(LastValue::new("done")));
+
+        let mut graph = StateGraph::new(channels);
+        let names: Vec<String> = (0..nodes).map(|i| format!("node_{i}")).collect();
+        for (i, name) in names.iter().enumerate() {
+            let is_last = i + 1 == nodes;
+            graph
+                .add_node(
+                    name.clone(),
+                    move |_input: JsonValue, _config: RunnableConfig| {
+                        let is_last = is_last;
+                        async move {
+                            Ok(if is_last {
+                                json!({"done": true})
+                            } else {
+                                json!({})
+                            })
+                        }
+                    },
+                )
+                .unwrap();
+        }
+        graph.add_edge(START, names[0].clone()).unwrap();
+        for i in 0..nodes - 1 {
+            graph
+                .add_edge(names[i].clone(), names[i + 1].clone())
+                .unwrap();
+        }
+        graph.add_edge(names[nodes - 1].clone(), END).unwrap();
+        let app = graph.compile().unwrap();
+
+        let config = RunnableConfig::new().with_recursion_limit(100_000);
+
+        let mut best = Duration::MAX;
+        for _ in 0..REPS {
+            let t = Instant::now();
+            let output = app.ainvoke(&json!({}), &config).await.unwrap();
+            best = best.min(t.elapsed());
+            assert_eq!(
+                output.get("done"),
+                Some(&json!(true)),
+                "chain was truncated: expected all {nodes} nodes to run"
+            );
+        }
+        println!(
+            "sequential chain: {nodes:>4} no-op nodes => {best:?}  ({:?}/node)",
+            best / nodes as u32
+        );
+    }
+}
+
 /// The win case for incremental writes: a large static channel (e.g. embedded
 /// knowledge base) written once at thread start, then untouched while
 /// `messages` grows every step. Without delta writes the static channel's
@@ -638,7 +756,112 @@ async fn bench_sqlite_static_context() {
             "sqlite static context: {steps:>4} steps, {CONTEXT_SIZE}-byte static channel => {elapsed:?}  ({:?}/step)",
             elapsed / (steps - 1) as u32
         );
+
+        // Correctness: the static context must survive every step (version-
+        // merged reads + BlobCache must reconstruct it) and messages accumulate.
+        let snapshot = app.get_state(&config).unwrap();
+        let ctx_len = snapshot
+            .values
+            .get("context")
+            .and_then(|c| c.as_str())
+            .map(|s| s.len())
+            .unwrap_or(0);
+        assert_eq!(ctx_len, CONTEXT_SIZE, "static context was truncated");
+        let msg_count = snapshot
+            .values
+            .get("messages")
+            .and_then(|m| m.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0);
+        // Each invoke adds two messages (the input write plus the node's
+        // append), so `steps` invokes accumulate 2*steps — matching the
+        // sanity_bench_graphs_work invariant (2 invokes => 4 messages).
+        assert_eq!(
+            msg_count,
+            2 * steps,
+            "message count mismatch: got {msg_count}, expected {}",
+            2 * steps
+        );
     }
+}
+
+/// Read-side isolation of the BlobCache: seed a large static channel once,
+/// then hammer get_state (pure reads, no writes). Each read must resolve the
+/// full static context; with the BlobCache the context blob is parsed once and
+/// cloned thereafter.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn bench_sqlite_static_context_reads() {
+    const CONTEXT_SIZE: usize = 128 * 1024;
+    const READS: usize = 200;
+
+    let saver = SqliteSaver::from_conn_string("sqlite::memory:")
+        .await
+        .unwrap();
+    saver.setup().await.unwrap();
+
+    let mut channels: HashMap<String, Box<dyn Channel>> = HashMap::new();
+    channels.insert(
+        "messages".to_string(),
+        Box::new(BinaryOperatorAggregate::new("messages", add_messages_ref)) as Box<dyn Channel>,
+    );
+    channels.insert(
+        "context".to_string(),
+        Box::new(LastValue::new("context")) as Box<dyn Channel>,
+    );
+
+    let mut graph = StateGraph::new(channels);
+    graph
+        .add_node(
+            "append",
+            |input: JsonValue, _config: RunnableConfig| async move {
+                let n = input
+                    .get("messages")
+                    .and_then(|m| m.as_array())
+                    .map(|a| a.len())
+                    .unwrap_or(0);
+                Ok(json!({"messages": [make_message(n)]}))
+            },
+        )
+        .unwrap();
+    graph.add_edge(START, "append").unwrap();
+    graph.add_edge("append", END).unwrap();
+    let app = graph
+        .compile_builder()
+        .checkpointer(Arc::new(saver))
+        .build()
+        .unwrap();
+
+    let mut config = RunnableConfig::new();
+    config.insert(
+        "configurable".to_string(),
+        json!({"thread_id": "bench-ctx-reads"}),
+    );
+
+    // Seed the static channel once.
+    app.ainvoke(
+        &json!({"messages": [make_message(0)], "context": "x".repeat(CONTEXT_SIZE)}),
+        &config,
+    )
+    .await
+    .unwrap();
+
+    // Cold read: the cache is empty, so the 128KB context blob must be
+    // fetched and parsed from the DB.
+    let cold_start = Instant::now();
+    let _ = app.get_state(&config).unwrap();
+    let cold = cold_start.elapsed();
+
+    // Warm reads: BlobCache hits, clone-only.
+    let start = Instant::now();
+    for _ in 0..READS {
+        let _ = app.get_state(&config).unwrap();
+    }
+    let elapsed = start.elapsed();
+    println!(
+        "sqlite static context reads: cold {cold:?} (cache miss, parses blob) vs {READS} warm get_state reads of {CONTEXT_SIZE}-byte static channel => {elapsed:?}  ({:?}/read warm)",
+        elapsed / READS as u32
+    );
 }
 
 /// Guards against the benchmark graphs silently becoming no-ops.
@@ -664,5 +887,49 @@ async fn sanity_bench_graphs_work() {
             .and_then(|m| m.as_array())
             .map(|a| a.len()),
         Some(4)
+    );
+}
+
+/// P2-1: sync `invoke()` from outside a tokio context used to build and drop a
+/// full multi-thread Runtime per call (each construction spawns worker threads,
+/// ~100µs+). A process-global cached runtime amortizes that.
+///
+/// Plain `#[test]` — NOT `#[tokio::test]` — so this runs outside a tokio
+/// context and actually hits the `Runtime::new()`/cached-runtime path in
+/// `CompiledStateGraph::invoke`.
+#[test]
+#[ignore]
+fn bench_sync_invoke_runtime_cache() {
+    let mut channels: HashMap<String, Box<dyn Channel>> = HashMap::new();
+    channels.insert(
+        "out".to_string(),
+        Box::new(LastValue::new("out")) as Box<dyn Channel>,
+    );
+    let mut graph = StateGraph::new(channels);
+    graph
+        .add_node("n", |_: JsonValue, _: RunnableConfig| async move {
+            Ok(json!({"out": 1}))
+        })
+        .unwrap();
+    graph.add_edge(START, "n").unwrap();
+    graph.add_edge("n", END).unwrap();
+    let app = graph.compile().unwrap();
+    let config = RunnableConfig::new();
+
+    // Warm up: the first invoke builds the shared runtime.
+    assert_eq!(
+        app.invoke(&json!({}), &config).unwrap().get("out"),
+        Some(&json!(1))
+    );
+
+    const N: usize = 200;
+    let t = Instant::now();
+    for _ in 0..N {
+        app.invoke(&json!({}), &config).unwrap();
+    }
+    let elapsed = t.elapsed();
+    println!(
+        "sync invoke x{N} (outside tokio) => {elapsed:?}  ({:?}/invoke)",
+        elapsed / N as u32
     );
 }
